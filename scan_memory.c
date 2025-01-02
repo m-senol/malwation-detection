@@ -7,7 +7,7 @@
 #include <libvmi/libvmi.h>
 #include <yara.h>
 
-int init(vmi_instance_t* vmi, char** yara_rule_file, int argc, char* argv[], vmi_init_data_t **init_data, unsigned long* tasks_offset, unsigned long* pid_offset, unsigned long* name_offset, int* verbose)
+int init(vmi_instance_t* vmi, int argc, char* argv[], vmi_init_data_t **init_data, unsigned long* tasks_offset, unsigned long* pid_offset, unsigned long* name_offset, int* verbose, YR_RULES** rules)
 {
     uint64_t domid = 0;
     uint8_t init = VMI_INIT_DOMAINNAME, config_type = VMI_CONFIG_GLOBAL_FILE_ENTRY;
@@ -67,13 +67,22 @@ int init(vmi_instance_t* vmi, char** yara_rule_file, int argc, char* argv[], vmi
                     (*init_data)->entry[0].data = strdup(optarg);
                     break;
                 case 'y':
-                    *yara_rule_file = (char*)malloc(strlen(optarg) + 1);
-                    if (*yara_rule_file == NULL)
-                    {
-                        fprintf(stderr, "Memory allocation failed while copying yara rule file\n");
-                        return 1;
-                    }
-                    strncpy(*yara_rule_file, optarg, strlen(optarg) + 1);
+                        yr_initialize();
+
+                        FILE* rule_file = fopen(optarg, "r");
+                        if (rule_file == NULL)
+                        {
+                            fprintf(stderr, "Failed to open YARA rule file: test.yar\n");
+                            yr_finalize();
+                            return 1;
+                        }
+                        YR_COMPILER* compiler = NULL;
+                        yr_compiler_create(&compiler);
+                        yr_compiler_add_file(compiler, rule_file, NULL, NULL);
+                        fclose(rule_file);
+                        yr_compiler_get_rules(compiler, rules);
+                        yr_compiler_destroy(compiler);
+
                     break;
                 case 'v':
                     *verbose = 1;
@@ -85,11 +94,7 @@ int init(vmi_instance_t* vmi, char** yara_rule_file, int argc, char* argv[], vmi
             }
         }
     }
-    if (*yara_rule_file == NULL)
-    {
-        fprintf(stderr, "-y/--yara is a mandatory argument\n");
-        return 1;
-    }
+
     if (all_set == 0)
     {
         fprintf(stderr, "No init info given for vmi\n");
@@ -133,7 +138,7 @@ int init(vmi_instance_t* vmi, char** yara_rule_file, int argc, char* argv[], vmi
     return 0;
 }
 
-void clean_up(vmi_instance_t vmi, vmi_init_data_t *init_data, char* yara_rule_file)
+void clean_up(vmi_instance_t vmi, vmi_init_data_t *init_data, YR_RULES* rules)
 {
     vmi_resume_vm(vmi);
     vmi_destroy(vmi);
@@ -143,7 +148,8 @@ void clean_up(vmi_instance_t vmi, vmi_init_data_t *init_data, char* yara_rule_fi
         free(init_data);
     }
 
-    free(yara_rule_file);
+    yr_rules_destroy(rules);
+    yr_finalize();
 }
 
 int get_list_head(vmi_instance_t vmi, unsigned long tasks_offset, os_t os, addr_t* list_head, addr_t* cur_list_entry, addr_t* next_list_entry)
@@ -189,42 +195,18 @@ int get_list_head(vmi_instance_t vmi, unsigned long tasks_offset, os_t os, addr_
     return 0;
 }
 
-int scan(char* filename, uint8_t* data_to_scan, size_t size)
+int scan(uint8_t* data_to_scan, size_t size, YR_RULES* rules)
 {
     int result = 0;
-    yr_initialize();
-
-    FILE* rule_file = fopen(filename, "r");
-    if (rule_file == NULL) {
-        fprintf(stderr, "Failed to open YARA rule file: test.yar\n");
-        yr_finalize();
-        return result;
-    }
-
-    YR_COMPILER* compiler = NULL;
-    YR_RULES* rules = NULL;
-
-    yr_compiler_create(&compiler);
-
-    yr_compiler_add_file(compiler, rule_file, NULL, NULL);
-    
-    fclose(rule_file);
-
-    yr_compiler_get_rules(compiler, &rules);
-
     if (yr_rules_scan_mem(rules, data_to_scan, size, 0, NULL, NULL, 0) == ERROR_SUCCESS) {
         result = 1;
     } else {
         result = 0;
     }
-
-    yr_compiler_destroy(compiler);
-    yr_rules_destroy(rules);
-    yr_finalize();
     return result;
 }
 
-void traverse_vad_tree(vmi_instance_t vmi, addr_t node, unsigned long left_offset, unsigned long right_offset, unsigned long start_offset, unsigned long end_offset, char* process_name, char* filename)
+void traverse_vad_tree(vmi_instance_t vmi, addr_t node, unsigned long left_offset, unsigned long right_offset, unsigned long start_offset, unsigned long end_offset, char* process_name, YR_RULES* rules)
 {
     if (node == 0)
     {
@@ -245,7 +227,7 @@ void traverse_vad_tree(vmi_instance_t vmi, addr_t node, unsigned long left_offse
         uint8_t buffer[page_size];
         if (VMI_SUCCESS == vmi_read_pa(vmi, addr, page_size, buffer, NULL))
         {
-            if (scan(filename, buffer, page_size) == 1)
+            if (scan(buffer, page_size, rules) == 1)
             {
                 printf("Found in task %s\n", process_name);
             }
@@ -258,11 +240,11 @@ void traverse_vad_tree(vmi_instance_t vmi, addr_t node, unsigned long left_offse
     vmi_read_addr_va(vmi, node + right_offset, 0, &right_child);
 
 
-    traverse_vad_tree(vmi, left_child, left_offset, right_offset, start_offset, end_offset, process_name, filename);
-    traverse_vad_tree(vmi, right_child, left_offset, right_offset, start_offset, end_offset, process_name, filename);
+    traverse_vad_tree(vmi, left_child, left_offset, right_offset, start_offset, end_offset, process_name, rules);
+    traverse_vad_tree(vmi, right_child, left_offset, right_offset, start_offset, end_offset, process_name, rules);
 }
 
-int loop(vmi_instance_t vmi, os_t os, addr_t list_head, addr_t* cur_list_entry, addr_t* next_list_entry, unsigned long tasks_offset, unsigned long pid_offset, unsigned long name_offset, unsigned long vadroot_offset, unsigned long avltreeleftchild_offset, unsigned long avltreerightchild_offset, unsigned long avltreestartingvpn_offset, unsigned long avltreeendingvpn_offset, char* filename, int verbose)
+int loop(vmi_instance_t vmi, os_t os, addr_t list_head, addr_t* cur_list_entry, addr_t* next_list_entry, unsigned long tasks_offset, unsigned long pid_offset, unsigned long name_offset, unsigned long vadroot_offset, unsigned long avltreeleftchild_offset, unsigned long avltreerightchild_offset, unsigned long avltreestartingvpn_offset, unsigned long avltreeendingvpn_offset, YR_RULES* rules, int verbose)
 {
     addr_t current_process = 0, vad_root = 0, vad_root_pointer = 0;
     vmi_pid_t pid = 0;
@@ -289,7 +271,7 @@ int loop(vmi_instance_t vmi, os_t os, addr_t list_head, addr_t* cur_list_entry, 
         }
         
 
-        traverse_vad_tree(vmi, vad_root, avltreeleftchild_offset, avltreerightchild_offset, avltreestartingvpn_offset, avltreeendingvpn_offset, procname, filename);
+        traverse_vad_tree(vmi, vad_root, avltreeleftchild_offset, avltreerightchild_offset, avltreestartingvpn_offset, avltreeendingvpn_offset, procname, rules);
 
         if (procname)
         {
@@ -337,40 +319,40 @@ int main(int argc, char* argv[])
         return 1;
     }
     
+    YR_RULES* rules = NULL;
     int verbose = 0;
     vmi_instance_t vmi = {0};
     addr_t list_head = 0, cur_list_entry = 0, next_list_entry = 0;
     unsigned long tasks_offset = 0, pid_offset = 0, name_offset = 0;
     unsigned long vadroot_offset = 0x448, avltreeleftchild_offset = 0x8, avltreerightchild_offset = 0x10, avltreestartingvpn_offset = 0x18, avltreeendingvpn_offset = 0x20; // temporaryly here
     vmi_init_data_t *init_data = NULL;
-    char* yara_rule_file = NULL;
-    if (init(&vmi, &yara_rule_file, argc, argv, &init_data, &tasks_offset, &pid_offset, &name_offset, &verbose) == 1)
+    if (init(&vmi, argc, argv, &init_data, &tasks_offset, &pid_offset, &name_offset, &verbose, &rules) == 1)
     {
         fprintf(stderr, "Error initiliasing the program\n");
-        clean_up(vmi, init_data, yara_rule_file);
+        clean_up(vmi, init_data, rules);
         return 1;
     }
 
     if (vmi_pause_vm(vmi) != VMI_SUCCESS)
     {
         printf("Failed to pause VM\n");
-        clean_up(vmi, init_data, yara_rule_file);
+        clean_up(vmi, init_data, rules);
         return 1;
     }
 
     os_t os = vmi_get_ostype(vmi);
     if (get_list_head(vmi, tasks_offset, os, &list_head, &cur_list_entry, &next_list_entry) == 1)
     {
-        clean_up(vmi, init_data, yara_rule_file);
+        clean_up(vmi, init_data, rules);
         return 1;
     }
 
-    if (loop(vmi, os, list_head, &cur_list_entry, &next_list_entry, tasks_offset, pid_offset, name_offset, vadroot_offset, avltreeleftchild_offset, avltreerightchild_offset, avltreestartingvpn_offset, avltreeendingvpn_offset, yara_rule_file, verbose) == 1)
+    if (loop(vmi, os, list_head, &cur_list_entry, &next_list_entry, tasks_offset, pid_offset, name_offset, vadroot_offset, avltreeleftchild_offset, avltreerightchild_offset, avltreestartingvpn_offset, avltreeendingvpn_offset, rules, verbose) == 1)
     {
-        clean_up(vmi, init_data, yara_rule_file);
+        clean_up(vmi, init_data, rules);
         return 1;
     }
     
-    clean_up(vmi, init_data, yara_rule_file);
+    clean_up(vmi, init_data, rules);
     return 0;
 }
