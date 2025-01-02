@@ -5,6 +5,7 @@
 #include <getopt.h>
 
 #include <libvmi/libvmi.h>
+#include <yara.h>
 
 int init(vmi_instance_t* vmi, char** yara_rule_file, int argc, char* argv[], vmi_init_data_t **init_data, unsigned long* tasks_offset, unsigned long* pid_offset, unsigned long* name_offset)
 {
@@ -183,7 +184,42 @@ int get_list_head(vmi_instance_t vmi, unsigned long tasks_offset, os_t os, addr_
     return 0;
 }
 
-void traverse_vad_tree(vmi_instance_t vmi, addr_t node, unsigned long left_offset, unsigned long right_offset, unsigned long start_offset, unsigned long end_offset, vmi_pid_t pid)
+int scan(char* filename, uint8_t* data_to_scan, size_t size)
+{
+    int result = 0;
+    yr_initialize();
+
+    FILE* rule_file = fopen(filename, "r");
+    if (rule_file == NULL) {
+        fprintf(stderr, "Failed to open YARA rule file: test.yar\n");
+        yr_finalize();
+        return result;
+    }
+
+    YR_COMPILER* compiler = NULL;
+    YR_RULES* rules = NULL;
+
+    yr_compiler_create(&compiler);
+
+    yr_compiler_add_file(compiler, rule_file, NULL, NULL);
+    
+    fclose(rule_file);
+
+    yr_compiler_get_rules(compiler, &rules);
+
+    if (yr_rules_scan_mem(rules, data_to_scan, size, 0, NULL, NULL, 0) == ERROR_SUCCESS) {
+        result = 1;
+    } else {
+        result = 0;
+    }
+
+    yr_compiler_destroy(compiler);
+    yr_rules_destroy(rules);
+    yr_finalize();
+    return result;
+}
+
+void traverse_vad_tree(vmi_instance_t vmi, addr_t node, unsigned long left_offset, unsigned long right_offset, unsigned long start_offset, unsigned long end_offset, char* process_name, char* filename)
 {
     if (node == 0)
     {
@@ -204,12 +240,11 @@ void traverse_vad_tree(vmi_instance_t vmi, addr_t node, unsigned long left_offse
         uint8_t buffer[page_size];
         if (VMI_SUCCESS == vmi_read_pa(vmi, addr, page_size, buffer, NULL))
         {
-            printf("Read memory at 0x%lx for PID [%5d]\n", addr, pid);
-            // yara scan: TODO
-        }
-        else
-        {
-            printf("Failed to read memory at 0x%lx for PID [%5d]\n", addr, pid);
+            if (scan(filename, buffer, page_size) == 1)
+            {
+                printf("Found in task %s\n", process_name);
+            }
+            
         }
     }
 
@@ -218,11 +253,11 @@ void traverse_vad_tree(vmi_instance_t vmi, addr_t node, unsigned long left_offse
     vmi_read_addr_va(vmi, node + right_offset, 0, &right_child);
 
 
-    traverse_vad_tree(vmi, left_child, left_offset, right_offset, start_offset, end_offset, pid);
-    traverse_vad_tree(vmi, right_child, left_offset, right_offset, start_offset, end_offset, pid);
+    traverse_vad_tree(vmi, left_child, left_offset, right_offset, start_offset, end_offset, process_name, filename);
+    traverse_vad_tree(vmi, right_child, left_offset, right_offset, start_offset, end_offset, process_name, filename);
 }
 
-int loop(vmi_instance_t vmi, os_t os, addr_t list_head, addr_t* cur_list_entry, addr_t* next_list_entry, unsigned long tasks_offset, unsigned long pid_offset, unsigned long name_offset, unsigned long vadroot_offset, unsigned long avltreeleftchild_offset, unsigned long avltreerightchild_offset, unsigned long avltreestartingvpn_offset, unsigned long avltreeendingvpn_offset)
+int loop(vmi_instance_t vmi, os_t os, addr_t list_head, addr_t* cur_list_entry, addr_t* next_list_entry, unsigned long tasks_offset, unsigned long pid_offset, unsigned long name_offset, unsigned long vadroot_offset, unsigned long avltreeleftchild_offset, unsigned long avltreerightchild_offset, unsigned long avltreestartingvpn_offset, unsigned long avltreeendingvpn_offset, char* filename)
 {
     addr_t current_process = 0, vad_root = 0, vad_root_pointer = 0;
     vmi_pid_t pid = 0;
@@ -245,7 +280,7 @@ int loop(vmi_instance_t vmi, os_t os, addr_t list_head, addr_t* cur_list_entry, 
         
         printf("[%5d] %s (struct addr:%"PRIx64")\n", pid, procname, current_process);
 
-        traverse_vad_tree(vmi, vad_root, avltreeleftchild_offset, avltreerightchild_offset, avltreestartingvpn_offset, avltreeendingvpn_offset, pid);
+        traverse_vad_tree(vmi, vad_root, avltreeleftchild_offset, avltreerightchild_offset, avltreestartingvpn_offset, avltreeendingvpn_offset, procname, filename);
 
         if (procname)
         {
@@ -319,7 +354,7 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    if (loop(vmi, os, list_head, &cur_list_entry, &next_list_entry, tasks_offset, pid_offset, name_offset, vadroot_offset, avltreeleftchild_offset, avltreerightchild_offset, avltreestartingvpn_offset, avltreeendingvpn_offset) == 1)
+    if (loop(vmi, os, list_head, &cur_list_entry, &next_list_entry, tasks_offset, pid_offset, name_offset, vadroot_offset, avltreeleftchild_offset, avltreerightchild_offset, avltreestartingvpn_offset, avltreeendingvpn_offset, yara_rule_file) == 1)
     {
         clean_up(vmi, init_data, yara_rule_file);
         return 1;
