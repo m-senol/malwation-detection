@@ -7,7 +7,7 @@
 #include <libvmi/libvmi.h>
 #include <yara.h>
 
-int init(vmi_instance_t* vmi, char** yara_rule_file, int argc, char* argv[], vmi_init_data_t **init_data, unsigned long* tasks_offset, unsigned long* pid_offset, unsigned long* name_offset)
+int init(vmi_instance_t* vmi, char** yara_rule_file, int argc, char* argv[], vmi_init_data_t **init_data, unsigned long* tasks_offset, unsigned long* pid_offset, unsigned long* name_offset, int* verbose)
 {
     uint64_t domid = 0;
     uint8_t init = VMI_INIT_DOMAINNAME, config_type = VMI_CONFIG_GLOBAL_FILE_ENTRY;
@@ -25,9 +25,10 @@ int init(vmi_instance_t* vmi, char** yara_rule_file, int argc, char* argv[], vmi
             {"json", required_argument, NULL, 'j'},
             {"socket", optional_argument, NULL, 's'},
             {"yara", required_argument, NULL, 'y'},
+            {"verbose", no_argument, NULL, 'v'},
             {NULL, 0, NULL, 0}
         };
-        const char* opts = "n:d:j:s:y:";
+        const char* opts = "n:d:j:s:y:v";
         int c;
         int long_index = 0;
 
@@ -74,6 +75,10 @@ int init(vmi_instance_t* vmi, char** yara_rule_file, int argc, char* argv[], vmi
                     }
                     strncpy(*yara_rule_file, optarg, strlen(optarg) + 1);
                     break;
+                case 'v':
+                    *verbose = 1;
+                    break;
+
                 default:
                     fprintf(stderr, "Unknown option\n");
                     return 1;
@@ -257,7 +262,7 @@ void traverse_vad_tree(vmi_instance_t vmi, addr_t node, unsigned long left_offse
     traverse_vad_tree(vmi, right_child, left_offset, right_offset, start_offset, end_offset, process_name, filename);
 }
 
-int loop(vmi_instance_t vmi, os_t os, addr_t list_head, addr_t* cur_list_entry, addr_t* next_list_entry, unsigned long tasks_offset, unsigned long pid_offset, unsigned long name_offset, unsigned long vadroot_offset, unsigned long avltreeleftchild_offset, unsigned long avltreerightchild_offset, unsigned long avltreestartingvpn_offset, unsigned long avltreeendingvpn_offset, char* filename)
+int loop(vmi_instance_t vmi, os_t os, addr_t list_head, addr_t* cur_list_entry, addr_t* next_list_entry, unsigned long tasks_offset, unsigned long pid_offset, unsigned long name_offset, unsigned long vadroot_offset, unsigned long avltreeleftchild_offset, unsigned long avltreerightchild_offset, unsigned long avltreestartingvpn_offset, unsigned long avltreeendingvpn_offset, char* filename, int verbose)
 {
     addr_t current_process = 0, vad_root = 0, vad_root_pointer = 0;
     vmi_pid_t pid = 0;
@@ -278,7 +283,11 @@ int loop(vmi_instance_t vmi, os_t os, addr_t list_head, addr_t* cur_list_entry, 
         vmi_read_addr_va(vmi, current_process + vadroot_offset, 0, &vad_root_pointer);
         vmi_read_addr_va(vmi, vad_root_pointer, 0, &vad_root);
         
-        printf("[%5d] %s (struct addr:%"PRIx64")\n", pid, procname, current_process);
+        if (verbose)
+        {
+            printf("[%5d] %s (struct addr:%"PRIx64")\n", pid, procname, current_process);
+        }
+        
 
         traverse_vad_tree(vmi, vad_root, avltreeleftchild_offset, avltreerightchild_offset, avltreestartingvpn_offset, avltreeendingvpn_offset, procname, filename);
 
@@ -324,16 +333,18 @@ int main(int argc, char* argv[])
         printf("\t -j/--json <path to kernel's json profile>\n");
         printf("\t -s/--socket <path to KVMI socket>\n");
         printf("\t -y/--yara <yara rule file>\n");
+        printf("\t -v/--verbose");
         return 1;
     }
     
+    int verbose = 0;
     vmi_instance_t vmi = {0};
     addr_t list_head = 0, cur_list_entry = 0, next_list_entry = 0;
     unsigned long tasks_offset = 0, pid_offset = 0, name_offset = 0;
     unsigned long vadroot_offset = 0x448, avltreeleftchild_offset = 0x8, avltreerightchild_offset = 0x10, avltreestartingvpn_offset = 0x18, avltreeendingvpn_offset = 0x20; // temporaryly here
     vmi_init_data_t *init_data = NULL;
     char* yara_rule_file = NULL;
-    if (init(&vmi, &yara_rule_file, argc, argv, &init_data, &tasks_offset, &pid_offset, &name_offset) == 1)
+    if (init(&vmi, &yara_rule_file, argc, argv, &init_data, &tasks_offset, &pid_offset, &name_offset, &verbose) == 1)
     {
         fprintf(stderr, "Error initiliasing the program\n");
         clean_up(vmi, init_data, yara_rule_file);
@@ -354,7 +365,7 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    if (loop(vmi, os, list_head, &cur_list_entry, &next_list_entry, tasks_offset, pid_offset, name_offset, vadroot_offset, avltreeleftchild_offset, avltreerightchild_offset, avltreestartingvpn_offset, avltreeendingvpn_offset, yara_rule_file) == 1)
+    if (loop(vmi, os, list_head, &cur_list_entry, &next_list_entry, tasks_offset, pid_offset, name_offset, vadroot_offset, avltreeleftchild_offset, avltreerightchild_offset, avltreestartingvpn_offset, avltreeendingvpn_offset, yara_rule_file, verbose) == 1)
     {
         clean_up(vmi, init_data, yara_rule_file);
         return 1;
