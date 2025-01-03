@@ -187,13 +187,24 @@ int ScanMemory::init(int argc, char* argv[])
     return 0;
 }
 
-int ScanMemory::scan(uint8_t* data_to_scan, size_t size)
+int ScanMemory::yara_callback(YR_SCAN_CONTEXT* context, int message, void* message_data, void* user_data)
 {
-    int result = 0;
-    if (yr_rules_scan_mem(rules, data_to_scan, size, 0, NULL, NULL, 0) == ERROR_SUCCESS) {
-        result = 1;
+    (void) context; (void) message_data;
+    if (message == CALLBACK_MSG_RULE_MATCHING)
+    {
+        printf("Rule matched in %s\n", (char*)user_data);
+        return CALLBACK_CONTINUE;
     }
-    return result;
+    return CALLBACK_CONTINUE;
+}
+
+int ScanMemory::scan(uint8_t* data_to_scan, size_t size, char* process_name)
+{
+    if (yr_rules_scan_mem(rules, data_to_scan, size, 0, yara_callback, process_name, 0) != ERROR_SUCCESS)
+    {
+        return 1;
+    }
+    return 0;
 }
 
 void ScanMemory::traverse_vad_tree(addr_t node, char* process_name)
@@ -215,7 +226,7 @@ void ScanMemory::traverse_vad_tree(addr_t node, char* process_name)
         uint8_t buffer[page_size];
         if (VMI_SUCCESS == vmi_read_pa(vmi, addr, page_size, buffer, NULL))
         {
-            if (scan(buffer, page_size) == 1)
+            if (scan(buffer, page_size, process_name) == 1)
             {
                 printf("Found in task %s\n", process_name);
             }

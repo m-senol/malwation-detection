@@ -22,7 +22,8 @@ private:
     
     int init_list_head();
     void traverse_vad_tree(addr_t node, char* process_name);
-    int scan(uint8_t* data_to_scan, size_t size);
+    static int yara_callback(YR_SCAN_CONTEXT* context, int message, void* message_data, void* user_data);
+    int scan(uint8_t* data_to_scan, size_t size, char* process_name);
 
 public:
     ScanMemory();
