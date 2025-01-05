@@ -4,8 +4,8 @@ ScanMemory::ScanMemory():
 vmi(0), rules(NULL), list_head(0), cur_list_entry(0), next_list_entry(0),
 tasks_offset(0), pid_offset(0), name_offset(0), vadroot_offset(0x448),
 avltreeleftchild_offset(0x8), avltreerightchild_offset(0x10),
-avltreestartingvpn_offset(0x18), avltreeendingvpn_offset(0x20), verbose(0),
-init_data(NULL), page_size(4096)
+avltreestartingvpn_offset(0x18), avltreeendingvpn_offset(0x20), depth_offset(0x28)
+, verbose(0), init_data(NULL), page_size(4096)
 {
 }
 
@@ -27,14 +27,14 @@ int ScanMemory::init_list_head()
 {
     if (VMI_FAILURE == vmi_read_addr_ksym(vmi, "PsActiveProcessHead", &list_head))
     {
-        printf("Failed to find PsActiveProcessHead\n");
+        fprintf(stderr, "Failed to find PsActiveProcessHead\n");
         return 1;
     }
 
     cur_list_entry = list_head;
     if (VMI_FAILURE == vmi_read_addr_va(vmi, cur_list_entry, 0, &next_list_entry))
     {
-        printf("Failed to read next pointer at %" PRIx64 "\n", cur_list_entry);
+        fprintf(stderr, "Failed to read next pointer at %lx\n", cur_list_entry);
         return 1;
     }
 
@@ -180,7 +180,7 @@ int ScanMemory::init(int argc, char* argv[])
 
     if (vmi_pause_vm(vmi) != VMI_SUCCESS)
     {
-        printf("Failed to pause VM\n");
+        fprintf(stderr, "Failed to pause the VM\n");
         return 1;
     }
     
@@ -207,77 +207,83 @@ int ScanMemory::scan(uint8_t* data_to_scan, size_t size, char* process_name)
     return 0;
 }
 
-void ScanMemory::traverse_vad_tree(addr_t node, char* process_name)
+void ScanMemory::traverse_vad_tree(addr_t node, char* process_name, vmi_pid_t pid, uint64_t depth)
 {
-    if (node == 0)
+    if (depth == 0 || node == 0)
     {
         return;
     }
 
     uint64_t starting_vpn = 0, ending_vpn = 0;
-    vmi_read_64_va(vmi, node + avltreestartingvpn_offset, 0, &starting_vpn);
-    vmi_read_64_va(vmi, node + avltreeendingvpn_offset, 0, &ending_vpn);
+    if ( VMI_SUCCESS != vmi_read_64_va(vmi, node + avltreestartingvpn_offset, 0, &starting_vpn) 
+    ||   VMI_SUCCESS != vmi_read_64_va(vmi, node + avltreeendingvpn_offset  , 0, &ending_vpn  ))
+    {
+        fprintf(stderr, "Fail reading at node %lx\n", node);
+        return;
+    }
 
     uint64_t start_adress = starting_vpn * page_size;
-    uint64_t end_adress = ((ending_vpn + 1) * page_size ) - 1;
+    uint64_t end_adress = ((ending_vpn + 1) * page_size);
 
-    for (uint64_t addr = start_adress; addr <= end_adress; addr+=page_size)
+    for (uint64_t addr = start_adress; addr < end_adress; addr+=page_size)
     {
         uint8_t buffer[page_size];
-        if (VMI_SUCCESS == vmi_read_pa(vmi, addr, page_size, buffer, NULL))
+        if (VMI_SUCCESS == vmi_read_va(vmi, addr, pid, page_size, buffer, NULL))
         {
             if (scan(buffer, page_size, process_name) == 1)
             {
-                printf("Found in task %s\n", process_name);
+                fprintf(stderr, "Scan Error in task %s\n", process_name);
             }
-            
         }
     }
 
     addr_t left_child = 0, right_child = 0;
-    vmi_read_addr_va(vmi, node + avltreeleftchild_offset, 0, &left_child);
-    vmi_read_addr_va(vmi, node + avltreerightchild_offset, 0, &right_child);
-
-
-    traverse_vad_tree(left_child, process_name);
-    traverse_vad_tree(right_child, process_name);
+    if ( VMI_SUCCESS != vmi_read_addr_va(vmi, node + avltreeleftchild_offset , 0, &left_child ) 
+    ||   VMI_SUCCESS != vmi_read_addr_va(vmi, node + avltreerightchild_offset, 0, &right_child))
+    {
+        fprintf(stderr, "failed reading childs\n");
+        return;
+    }
+    traverse_vad_tree(left_child, process_name, pid, depth-1);
+    traverse_vad_tree(right_child, process_name, pid, depth-1);
 }
 
 int ScanMemory::run()
 {
-    addr_t current_process = 0, vad_root = 0, vad_root_pointer = 0;
+    addr_t current_process = 0, vad_root = 0;
     vmi_pid_t pid = 0;
     char* process_name = NULL;
+    uint64_t depth = 0;
 
     while(1)
     {
         current_process = cur_list_entry - tasks_offset;
+        vad_root = current_process + vadroot_offset;
 
         vmi_read_32_va(vmi, current_process + pid_offset, 0, (uint32_t*)&pid);
-
-        vmi_read_addr_va(vmi, current_process + vadroot_offset, 0, &vad_root_pointer);
-        vmi_read_addr_va(vmi, vad_root_pointer, 0, &vad_root);
+        vmi_read_64_va(vmi, vad_root + depth_offset, 0, &depth);
 
         process_name = vmi_read_str_va(vmi, current_process + name_offset, 0);
         if (!process_name)
         {
-            printf("Failed to find procname\n");
+            fprintf(stderr, "Failed to find procname\n");
             return 1;
         }
         if (verbose)
         {
-            printf("[%5d] %s (struct addr:%" PRIx64 ")\n", pid, process_name, current_process);
+            printf("[%5d] %s (struct addr:%lx)\n", pid, process_name, current_process);
         }
-        traverse_vad_tree(vad_root, process_name);
+
+        traverse_vad_tree(vad_root, process_name, pid, depth);
 
         cur_list_entry = next_list_entry;
 
         if (vmi_read_addr_va(vmi, cur_list_entry, 0, &next_list_entry) == VMI_FAILURE)
         {
-            printf("Failed to read next pointer in loop at %" PRIx64 "\n", cur_list_entry);
+            fprintf(stderr, "Failed to read next pointer in loop at %lx\n", cur_list_entry);
             return 1;
         }
-
+        
         if (next_list_entry == list_head)
         {
             break;
